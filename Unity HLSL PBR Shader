@@ -1,0 +1,171 @@
+Shader "URP/PBR"
+{
+    Properties
+    {
+        [NoScaleOffset]_MainTex ("MainTex", 2D) = "white" {}
+        _Color("Color", Color) = (1.0, 1.0, 1.0, 1.0)
+        [NoScaleOffset]_MROTex("MROTex", 2D) = "white" {}
+        _Metallic("Metallic", Range(0.0, 1.0)) = 0.0
+        _Roughness("Roughness", Range(0.0, 1.0)) = 0.5
+        _AOStrength("AO Strength", Range(0.0, 1.0)) = 1.0
+        [NoScaleOffset]_CubeMap("CubeMap", CUBE) = "white" {}
+        [NoScaleOffset]_LUT("LUT", 2D) = "white" {}
+        [HideInInspector]_CubeMapMip("CubeMapMip", Range(0.0, 7.0)) = 7
+        [NoScaleOffset][Normal] _NormalMap("Normal Map", 2D) = "bump" {}
+        [HideInInspector]_NormalScale("Normal Scale", Range(0.0, 1.0)) = 1.0
+    }
+    
+    SubShader
+    {
+        Tags { 
+            "RenderPipeline" = "UniversalRenderPipeline"
+            "RenderType"="Opaque"
+        }
+        LOD 100
+
+        HLSLINCLUDE
+        #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+        #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+
+        CBUFFER_START(UnityPerMaterial)
+        float4 _Color;
+        float _Metallic;
+        float _Roughness;
+        float _AOStrength;
+        float _CubeMapMip;
+        float _NormalScale;
+        CBUFFER_END
+
+        TEXTURE2D(_MainTex);        SAMPLER(sampler_MainTex);
+        TEXTURE2D(_MROTex);         SAMPLER(sampler_MROTex);
+        TEXTURECUBE(_CubeMap);      SAMPLER(sampler_CubeMap);
+        TEXTURE2D(_LUT);            SAMPLER(sampler_LUT);
+        TEXTURE2D(_NormalMap);      SAMPLER(sampler_NormalMap);
+        ENDHLSL
+
+        Pass
+        {
+            Tags { "LightMode" = "UniversalForward" }
+            
+            HLSLPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag           
+
+            struct a2v
+            {
+                float4 positionOS : POSITION;
+                float2 uv : TEXCOORD0;
+                float3 normalOS : NORMAL;
+                float4 tangentOS : TANGENT;
+            };
+
+            struct v2f
+            {
+                float4 positionCS : SV_POSITION;
+                float2 uv : TEXCOORD0;
+                float3 positionWS : TEXCOORD1;
+                float3 normalWS : TEXCOORD2;
+                float3 tangentWS : TEXCOORD3;
+                float3 BtangentWS : TEXCOORD4;
+                float3 viewDirWS : TEXCOORD6;
+            };
+
+            v2f vert(a2v i)
+            {
+                v2f o;
+                o.positionCS = TransformObjectToHClip(i.positionOS.xyz);
+                o.positionWS = TransformObjectToWorld(i.positionOS.xyz);
+                o.uv = i.uv;
+                o.normalWS = normalize(TransformObjectToWorldNormal(i.normalOS));
+                o.tangentWS = normalize(TransformObjectToWorldDir(i.tangentOS));
+                o.BtangentWS = cross(o.normalWS.xyz,o.tangentWS.xyz) * i.tangentOS.w * unity_WorldTransformParams.w;
+                o.viewDirWS = normalize(_WorldSpaceCameraPos.xyz - TransformObjectToWorld(i.positionOS.xyz));
+                
+                return o;
+            }
+			
+
+            half4 frag(v2f i) : SV_Target
+            {
+                // 法线
+                float3 normalTS = UnpackNormalScale(SAMPLE_TEXTURE2D(_NormalMap,sampler_NormalMap,i.uv), _NormalScale);
+                float3x3 TBN = float3x3(i.tangentWS, i.BtangentWS, i.normalWS);
+                float3 N = normalize(mul(normalTS, TBN));
+                
+                // 获取主光源
+				        Light mainLight = GetMainLight();
+                float3 lightDirWS = mainLight.direction;
+                float3 lightColor = mainLight.color;
+                
+                // 计算中间向量
+                float3 halfDirWS = normalize(lightDirWS + i.viewDirWS);
+                float3 reflectDirWS = reflect(-i.viewDirWS, N);
+                
+                // 计算点积
+                float NdotL = saturate(dot(N, lightDirWS));
+                float NdotV = saturate(dot(N, i.viewDirWS));
+                float NdotH = saturate(dot(N, halfDirWS));
+                float VdotH = saturate(dot(i.viewDirWS, halfDirWS));
+                
+                // 采样纹理
+                float4 baseColor = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, i.uv) * _Color;
+                float4 mro = SAMPLE_TEXTURE2D(_MROTex, sampler_MROTex, i.uv);
+                
+                // 材质参数
+                float metallic = mro.r * _Metallic;
+                float roughness = max(mro.g * _Roughness, 0.05);    //强制粗糙度最小值为 0.05，避免数值过小导致计算问题。当粗糙度接近 0 时，PBR的BRDF计算公式（如法线分布函数）可能出现除零错误或数值溢出：
+                float occlusion = lerp(1.0, mro.b, _AOStrength);
+                
+                // F0计算
+                float3 dielectricSpec = float3(0.04, 0.04, 0.04);   //介电常数规格
+                float3 F0 = lerp(dielectricSpec, baseColor.rgb, metallic);
+                
+                // 直接光照BRDF
+                // 法线分布函数 (Trowbridge-Reitz GGX)
+                float alpha = roughness * roughness;
+                float alphaSq = alpha * alpha;
+                float denom = (NdotH * NdotH * (alphaSq - 1.0) + 1.0);
+                float D = alphaSq / (PI * denom * denom);
+                
+                // 几何函数 (Smith GGX)
+                float k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
+                float G1 = NdotL / (NdotL * (1.0 - k) + k);
+                float G2 = NdotV / (NdotV * (1.0 - k) + k);
+                float G = G1 * G2;
+                
+                // 菲涅尔方程 (Fresnel-Schlick)
+                float3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+                
+                // 漫反射和镜面反射
+                float3 kD = (1.0 - F) * (1.0 - metallic);
+                float3 diffuse = kD * baseColor.rgb;
+                float3 specular = (D * G * F) / (4.0 * NdotL * NdotV + 0.0001) * PI;
+                
+                // 直接光照结果
+                float3 directLighting = (diffuse + specular) * lightColor * NdotL;     
+
+                // 间接光照
+                // 漫反射
+                float3 ambient = SampleSH(N) * kD * baseColor.rgb * occlusion;
+                
+                // 镜面反射
+                float mip = roughness * _CubeMapMip;
+                float4 encodedIrradiance = SAMPLE_TEXTURECUBE_LOD(_CubeMap, sampler_CubeMap, reflectDirWS, mip);
+                float3 irradiance = DecodeHDREnvironment(encodedIrradiance, unity_SpecCube0_HDR);
+                
+                float2 envBRDF = SAMPLE_TEXTURE2D(_LUT, sampler_LUT, float2(NdotV, roughness)).rg;
+                float3 Fenv = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+                float3 indirectSpecular = irradiance * (Fenv * envBRDF.x + envBRDF.y) * occlusion;
+                
+                // 组合间接光照
+                float3 indirectLighting = ambient + indirectSpecular;
+                
+                // 组合最终颜色
+                float3 finalColor = directLighting + indirectLighting;
+                
+                return float4(finalColor, 1.0);
+            }
+            ENDHLSL
+        }
+    }
+}
