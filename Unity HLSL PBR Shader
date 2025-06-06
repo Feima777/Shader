@@ -67,7 +67,7 @@ Shader "URP/PBR"
                 float3 normalWS : TEXCOORD2;
                 float3 tangentWS : TEXCOORD3;
                 float3 BtangentWS : TEXCOORD4;
-                float3 viewDirWS : TEXCOORD6;
+                float3 viewDirWS : TEXCOORD5;
             };
 
             v2f vert(a2v i)
