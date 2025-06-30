@@ -1,0 +1,26 @@
+using UnityEngine;
+using UnityEngine.Rendering;
+
+[VolumeComponentMenu("Post-processing/Bloom (Simple)")]
+public class BloomVolume : VolumeComponent
+{
+    [Tooltip("Bloom intensity (0 to disable)")]
+    public FloatParameter intensity = new FloatParameter(0f);
+    
+    [Tooltip("Brightness threshold (0-2)")]
+    public ClampedFloatParameter threshold = new ClampedFloatParameter(0.8f, 0f, 2f);
+    
+    [Tooltip("Soft transition (0-1)")]
+    public ClampedFloatParameter softKnee = new ClampedFloatParameter(0.5f, 0f, 1f);
+    
+    [Tooltip("Downsampling (1=no downscale, 4=max)")]
+    public ClampedIntParameter downscale = new ClampedIntParameter(2, 1, 4);
+    
+    [Tooltip("Blur iterations (1-6)")]
+    public ClampedIntParameter iterations = new ClampedIntParameter(3, 1, 6);
+    
+    [Tooltip("Bloom tint color")]
+    public ColorParameter tint = new ColorParameter(Color.white);
+
+    public bool IsActive() => intensity.value > 0f && this.active;
+}
