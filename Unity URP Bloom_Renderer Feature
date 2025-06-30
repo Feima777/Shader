@@ -1,0 +1,169 @@
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+public class BloomRenderer : ScriptableRendererFeature
+{
+    class BloomPass : ScriptableRenderPass
+    {
+        const int MaxIterations = 8;
+        
+        int[] bloomTexIDs = new int[MaxIterations];
+        int bloomBufferID = Shader.PropertyToID("_BloomBuffer");
+        int sourceTexID = Shader.PropertyToID("_SourceTex");
+        int bloomTexID = Shader.PropertyToID("_BloomTex");
+        int intensityID = Shader.PropertyToID("_Intensity");
+        int tintID = Shader.PropertyToID("_Tint");
+        int thresholdID = Shader.PropertyToID("_Threshold");
+        int softKneeID = Shader.PropertyToID("_SoftKnee");
+        
+        Material bloomMaterial;
+        BloomVolume volume;
+        RenderTargetIdentifier source;
+        RenderTargetIdentifier[] bloomTextures = new RenderTargetIdentifier[MaxIterations];
+        
+        public BloomPass(Material material)
+        {
+            bloomMaterial = material;
+            renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
+            
+            // Preallocate texture IDs
+            for (int i = 0; i < MaxIterations; i++)
+                bloomTexIDs[i] = Shader.PropertyToID("_BloomTex" + i);
+        }
+        
+        public void Setup(RenderTargetIdentifier source, BloomVolume volume)
+        {
+            this.source = source;
+            this.volume = volume;
+        }
+        
+        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+        {
+            if (bloomMaterial == null || volume == null || !volume.IsActive())
+                return;
+            
+            CommandBuffer cmd = CommandBufferPool.Get("Bloom");
+            
+            try
+            {
+                SetupBloom(cmd, renderingData);
+                context.ExecuteCommandBuffer(cmd);
+            }
+            finally
+            {
+                cmd.Clear();
+                CommandBufferPool.Release(cmd);
+            }
+        }
+        
+        void SetupBloom(CommandBuffer cmd, RenderingData renderingData)
+        {
+            // Get camera descriptor
+            var desc = renderingData.cameraData.cameraTargetDescriptor;
+            desc.depthBufferBits = 0;
+            desc.msaaSamples = 1;
+            
+            // Apply volume settings
+            bloomMaterial.SetFloat(thresholdID, volume.threshold.value);
+            bloomMaterial.SetFloat(softKneeID, volume.softKnee.value * 0.5f);
+            bloomMaterial.SetFloat(intensityID, volume.intensity.value);
+            bloomMaterial.SetColor(tintID, volume.tint.value);
+            
+            // Calculate iterations
+            int width = desc.width / volume.downscale.value;
+            int height = desc.height / volume.downscale.value;
+            int iterations = Mathf.Min(volume.iterations.value, MaxIterations);
+            
+            // Prefilter pass
+            cmd.GetTemporaryRT(bloomTexIDs[0], width, height, 0, FilterMode.Bilinear);
+            cmd.Blit(source, bloomTexIDs[0], bloomMaterial, 0);
+            
+            // Downsample passes
+            int lastDown = bloomTexIDs[0];
+            for (int i = 1; i < iterations; i++)
+            {
+                width = Mathf.Max(width / 2, 1);
+                height = Mathf.Max(height / 2, 1);
+                
+                cmd.GetTemporaryRT(bloomTexIDs[i], width, height, 0, FilterMode.Bilinear);
+                cmd.Blit(lastDown, bloomTexIDs[i], bloomMaterial, 1);
+                lastDown = bloomTexIDs[i];
+            }
+            
+            // Upsample passes
+            for (int i = iterations - 2; i >= 0; i--)
+            {
+                cmd.SetGlobalTexture(sourceTexID, bloomTexIDs[i]);
+                cmd.Blit(lastDown, bloomTexIDs[i], bloomMaterial, 2);
+                cmd.ReleaseTemporaryRT(lastDown);
+                lastDown = bloomTexIDs[i];
+            }
+            
+            // Final composite
+            cmd.GetTemporaryRT(bloomTexID, desc.width, desc.height, 0, FilterMode.Bilinear);
+            cmd.Blit(lastDown, bloomTexID);
+            cmd.SetGlobalTexture(bloomTexID, bloomTexID);
+            cmd.Blit(source, source, bloomMaterial, 3);
+            
+            // Cleanup
+            cmd.ReleaseTemporaryRT(lastDown);
+            cmd.ReleaseTemporaryRT(bloomTexID);
+        }
+        
+        public override void FrameCleanup(CommandBuffer cmd)
+        {
+            // Release all temporary textures
+            for (int i = 0; i < MaxIterations; i++)
+            {
+                if (bloomTexIDs[i] != 0)
+                    cmd.ReleaseTemporaryRT(bloomTexIDs[i]);
+            }
+        }
+    }
+    
+    BloomPass bloomPass;
+    Material bloomMaterial;
+    
+    public override void Create()
+    {
+        // Create bloom material
+        if (bloomMaterial == null)
+        {
+            var shader = Shader.Find("Hidden/URP/Bloom");
+            if (shader != null)
+                bloomMaterial = CoreUtils.CreateEngineMaterial(shader);
+        }
+        
+        // Create render pass
+        bloomPass = new BloomPass(bloomMaterial);
+    }
+    
+    public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+    {
+        // Skip for scene view or preview cameras
+        if (renderingData.cameraData.isSceneViewCamera || 
+            renderingData.cameraData.camera.cameraType == CameraType.Preview)
+            return;
+        
+        // Get bloom volume
+        var stack = VolumeManager.instance.stack;
+        var bloomVolume = stack.GetComponent<BloomVolume>();
+        if (bloomVolume == null || !bloomVolume.IsActive())
+            return;
+        
+        // Setup and add pass
+        bloomPass.Setup(renderer.cameraColorTarget, bloomVolume);
+        renderer.EnqueuePass(bloomPass);
+    }
+    
+    // URP 7.7 兼容的资源清理方法
+    protected virtual void OnDisable()
+    {
+        if (bloomMaterial != null)
+        {
+            CoreUtils.Destroy(bloomMaterial);
+            bloomMaterial = null;
+        }
+    }
+}
